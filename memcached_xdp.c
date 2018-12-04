@@ -8,7 +8,10 @@ BPF_PROG_ARRAY(prog_array, 10);
 BPF_DEVMAP(tx_port, 1);
 BPF_PERF_OUTPUT(NOTIFY_EVT);
 BPF_PERF_OUTPUT(PKT_EVT);
-BPF_PERCPU_ARRAY(rxcnt, long, 1);
+BPF_PERCPU_ARRAY(getcnt, long, 1);
+BPF_PERCPU_ARRAY(setcnt, long, 1);
+BPF_PERCPU_ARRAY(valcnt, long, 1);
+BPF_PERCPU_ARRAY(storedcnt, long, 1);
 
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest),(src),(n))
@@ -22,9 +25,9 @@ BPF_PERCPU_ARRAY(rxcnt, long, 1);
 #define MEMCPY(dest, src, n)\
 for (int i=0; i < n; i++) dest[i] = src[i];
 
-#define MAX_NOT 32
+#define MAX_NOT 30
 
-#define MAX_KEYLEN 18
+#define MAX_KEYLEN 16
 #define MAX_VALLEN 8
 
 struct key_t {
@@ -33,7 +36,6 @@ struct key_t {
 
 struct val_t {
     size_t size;
-    size_t keysize;
     char val[MAX_VALLEN];
 };
 
@@ -45,7 +47,7 @@ struct data_t {
 
 BPF_PERCPU_ARRAY(datamap, struct data_t, 1);
 
-BPF_HASH(MCD_MAP, struct key_t, struct val_t, 3e7);
+BPF_HASH(MCD_MAP, struct key_t, struct val_t, 3e5);
 
 struct not_t {
     size_t len;
@@ -60,8 +62,10 @@ static inline void notify(struct xdp_md *skb, const char *str, size_t len) {
 }
 
 #define NOTIFY(skb, str) \
-    notify(skb, str, sizeof(str) + 1)
+    notify(skb, str, strlen(str))
 
+#define PASS(x) \
+    NOTIFY(x, "Passing"); return XDP_PASS;
 
 #define MCD_PORT 11211
 
@@ -147,7 +151,7 @@ static inline int datafind1(struct data_t *data, unsigned int off, unsigned int 
 
 static inline size_t datafind2(struct data_t *data, unsigned int off, char find, char find2) {
 #pragma unroll
-    for (int i=off + 1; i < MAX_DATALEN - 9; i++) {
+    for (int i=off + 1; i < MAX_DATALEN - 10; i++) {
         if (data->data[i] == find){// && data->data[i+1] == find2) {
             return i - off;
         }
@@ -206,37 +210,43 @@ return htons(~( (__u16)(l>>16) + (l&0xffff) ));
 #define strlen(X) sizeof(X) - 1
 
 int handle_get(struct xdp_md *xdp) {
+    uint32_t k = 0;
+    long *value = getcnt.lookup(&k);
+    if (value) 
+        *value += 1;
     void *data_raw = (void*)(long)xdp->data;
     void *data_end = (void*)(long)xdp->data_end;
 
     uint32_t didx = 0;
     struct data_t *data  = datamap.lookup(&didx);
     if (data == NULL) {
-        return XDP_PASS;
+        PASS(xdp);
     }
 
     if (!datacmp(data, GET_CMD, strlen(GET_CMD))) {
         //notify(xdp, data->data, 10);
-        //NOTIFY(xdp, "NOT SET");
-        return XDP_PASS;
+        NOTIFY(xdp, "NOT GET");
+        PASS(xdp);
     }
     size_t offset = strlen(GET_CMD);
 
     size_t keylen = datafind2(data, offset, '\r', '\n');
     if (keylen== 0) {
         NOTIFY(xdp, "GET but no space");
-        return XDP_PASS;
+        PASS(xdp);
     }
-    struct key_t key = {};
-    if (keylen >= sizeof(key.key)) {
+    struct key_t key;
+    if (keylen > sizeof(key.key)) {
         NOTIFY(xdp, "GET but too big");
-        return XDP_PASS;
+        PASS(xdp);
     }
 
 #pragma unroll
     for (int i=0; i < sizeof(key.key); i++) {
         if (i < keylen) {
             key.key[i] = data->data[offset + i];
+        } else {
+            key.key[i] = '\0';
         }
     }
 
@@ -245,12 +255,12 @@ int handle_get(struct xdp_md *xdp) {
         NOTIFY(xdp, "NOT FOUND");
         struct hdrs *h = data_raw;
         if (data_raw + sizeof(*h) > data_end) {
-            return XDP_PASS;
+            PASS(xdp);
         }
         swap_direction(h);
         char msg[] = NOT_FOUND_STR;
         if (data_raw + sizeof(*h) + strlen(NOT_FOUND_STR) > data_end) {
-            return XDP_PASS;
+            PASS(xdp);
         }
         memcpy(data_raw + sizeof(*h), msg, strlen(NOT_FOUND_STR));
         return XDP_TX;
@@ -259,17 +269,17 @@ int handle_get(struct xdp_md *xdp) {
     struct hdrs *h = data_raw;
     if (data_raw + sizeof(*h) > data_end) {
         NOTIFY(xdp, "BUT HOW!");
-        return XDP_PASS;
+        PASS(xdp);
     }
     struct hdrs h_orig = *h;
 
-    bpf_xdp_adjust_head(xdp, -50);
+    bpf_xdp_adjust_head(xdp, -40);
     void *data_n = (void*)(long)xdp->data;
     void *data_nend = (void*)(long)xdp->data_end;
 
     struct hdrs *h_new = data_n;
     if (data_n + sizeof(*h_new) > data_nend) {
-        return XDP_PASS;
+        PASS(xdp);
     }
     *h_new = h_orig;
     swap_direction(h_new);
@@ -298,7 +308,7 @@ int handle_get(struct xdp_md *xdp) {
     }
 
 #pragma unroll
-    for (int i = minoff; i < maxoff; i++) {
+    for (int i = minoff; i <= maxoff; i++) {
         if (i == realoff) {
             memcpy(data_nc+ i, " 0 ", 3);
         }
@@ -310,11 +320,11 @@ int handle_get(struct xdp_md *xdp) {
     char sizestr[6] = {};
     size_t sizesize = itoc(val->size, sizestr);
 
-    if (data_n + maxoff + 8 > data_nend) {
+    if (data_n + maxoff + 9 > data_nend) {
         return XDP_PASS;
     }
 
-    for (int i=minoff; i < maxoff; i++) {
+    for (int i=minoff; i <= maxoff; i++) {
         if (i == realoff) {
             memcpy(data_nc + i, sizestr, 6);
         }
@@ -324,22 +334,22 @@ int handle_get(struct xdp_md *xdp) {
     maxoff += 6;
     minoff += 1;
 
-    for (int i=minoff; i < maxoff; i++) {
+    for (int i=minoff; i <= maxoff; i++) {
         if (i == realoff) {
-            memcpy(data_nc + i, "\r\n", 2);
+            memcpy(data_nc + i, " \r\n", 3);
         }
     }
 
-    realoff += 2;
-    maxoff += 2;
-    minoff += 2;
+    realoff += 3;
+    maxoff += 3;
+    minoff += 3;
 
-    if (data_n + maxoff + sizeof(val->val) + 8 > data_nend) {
+    if (data_n + maxoff + sizeof(val->val) + 10 > data_nend) {
         return XDP_PASS;
     }
 
 #pragma unroll
-    for (int i=minoff; i < maxoff; i++) {
+    for (int i=minoff; i <= maxoff; i++) {
         if (i == realoff) {
             memcpy(data_nc + i, val->val, sizeof(val->val));
         }
@@ -350,145 +360,78 @@ int handle_get(struct xdp_md *xdp) {
     minoff += 2;
 
 #pragma unroll
-    for (int i=minoff; i < maxoff; i++) {
+    for (int i=minoff; i <= maxoff; i++) {
         if (i == realoff) {
             memcpy(data_nc + i, "\r\nEND\r\n", 8);
         }
     }
+    minoff += 7;
     realoff += 7;
-    
+    maxoff += 7;
+
 
     //memcpy(data_n + off, flagsstr, strlen(FLAG_STR));
 
     __u16 prevlen = h_new->ip.tot_len;
     h_new->ip.tot_len = htons(realoff - 14);
     h_new->udp.len = htons(realoff - sizeof(*h_new) + sizeof(h_new->udp) + 8);
-    h_new->udp.check = 0;
     h_new->ip.check = incr_check_s(h_new->ip.check, ntohs(prevlen), ntohs(h_new->ip.tot_len));
+    h_new->mcd.seq = 0;
+    h_new->mcd.zero = 0;
+    h_new->udp.check = 0;
+
+    value = valcnt.lookup(&k);
+    if (value)
+        *value += 1;
 
 
-    return XDP_TX;
-}
-
-
-    
-static inline bool handle_get_(struct xdp_md *skb, struct data_t *in, size_t len) {
-    
-    if (datacmp(in, GET_CMD, strlen(GET_CMD))) {
-        return false;
-    }
-
-    int off = strlen(GET_CMD);
-    return true;
-/*
-    ssize_t keylen_s = tok2(next, end, "\r\n", 2, MAX_KEYLEN);
-    if (keylen_s < 2) {
-        NOTIFY(skb, "GET with no key");
-        return false;
-    }
-
-    size_t keylen = keylen_s;
-    struct key_t key = {};
-    if (keylen >= sizeof(key.key)) {
-        NOTIFY(skb, "GET but too big!");
-        return false;
-    }
-
+    if (data_n + maxoff + 9 < data_nend) {
 #pragma unroll
-    for (int i=0; i < sizeof(key.key); i++) {
-        if (i < keylen - 2) {
-            key.key[i] = next[i];
+        for (int i=minoff; i < maxoff; i++) {
+            if (i == realoff) {
+                data_nc[i] =  '\0';
+                data_nc[i+1] = '\0';
+                data_nc[i+2] = '\0';
+                data_nc[i+3] = '\0';
+                data_nc[i+4] = '\0';
+                data_nc[i+5] = '\0';
+                data_nc[i+6] = '\0';
+                data_nc[i+7] = '\0';
+                data_nc[i+8] = '\0';
+            }
         }
     }
-    //notify(skb, key.key, MAX_KEYLEN);
 
-    struct val_t *val = MCD_MAP.lookup(&key);
-    if (val == NULL) {
-        char msg[] = NOT_FOUND_STR;
-        bpf_skb_store_bytes(skb, sizeof(struct hdrs),
-                            &msg, sizeof(msg), 0);
-        int rtn = bpf_skb_change_tail(skb, sizeof(struct hdrs) + sizeof(msg), 0);
-        bpf_clone_redirect(skb, 5, 0);
-        return true;
-    }
-    size_t off = sizeof(struct hdrs);
-    char valstr[] = VAL_STR;
-    bpf_skb_store_bytes(skb, off,
-                        &valstr, sizeof(valstr), 0);
-    off += sizeof(valstr) - 1;
-    bpf_skb_store_bytes(skb, off,
-                        &key.key, keylen , 0);
-
-    off += keylen - 2;
-    char flagsstr[] = FLAG_STR;
-    bpf_skb_store_bytes(skb, off,
-                        &flagsstr, sizeof(flagsstr), 0);
-
-    off += sizeof(flagsstr) - 1;
-    char sizestr[6] = {};
-    size_t sizesize = itoc(val->size - 2, sizestr);
-    bpf_skb_store_bytes(skb, off,
-                        &sizestr, 6, 0);
-
-    off += sizesize ;
-    char delim[] = "\r\n";
-    bpf_skb_store_bytes(skb, off,
-                        &delim, sizeof(delim), 0);
-
-    off += sizeof(delim) - 1;
-    bpf_skb_store_bytes(skb, off,
-                        &val->val, MAX_VALLEN, 0);
-    off += val->size;
-
-    char endstr[] = END_STR;
-    bpf_skb_store_bytes(skb, off,
-                        &endstr, sizeof(endstr), 0);
-    off += sizeof(endstr) - 1;
-
-    swap_direction(skb);
-    struct hdrs hdr;
-    bpf_skb_load_bytes(skb, 0,  &hdr, sizeof(hdr));
-    size_t prevlen = hdr.ip.tot_len;
-    hdr.ip.tot_len = htons(off - 14);
-    size_t prevudplen = hdr.udp.len;
-    hdr.udp.len = htons(off - sizeof(struct hdrs) + sizeof(struct udphdr) + sizeof(struct mcdhdr));
-    hdr.mcd.seq = 0;
-    hdr.mcd.zero = 0;
-    hdr.udp.check = 0;
-    bpf_skb_store_bytes(skb, 0, &hdr, sizeof(hdr), 0);
-    bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check), prevlen, hdr.ip.tot_len, 2);
-
-    int rtn = bpf_skb_change_tail(skb, off, 0);
-    bpf_clone_redirect(skb, 7, 0);
-
-
-    return true;
-    */
-
+    return XDP_TX;
 }
 
 
 #define IP_CSUM_OFFSET (ETH_HLEN + offsetof(struct iphdr, check))
 #define STORED_STR "STORED\r\n"
 
-int  handle_set(struct xdp_md *xdp) {
+int handle_set(struct xdp_md *xdp){
+    uint32_t k = 0;
+    long *value;
+    value = setcnt.lookup(&k);
+    if (value)
+        *value += 1;
     uint32_t didx = 0;
     struct data_t *data  = datamap.lookup(&didx);
     if (data == NULL) {
-        return XDP_PASS;
+        PASS(xdp);
     }
 
     if (!datacmp(data, SET_CMD, strlen(SET_CMD))) {
         //notify(xdp, data->data, 10);
         NOTIFY(xdp, "NOT SET");
-        return XDP_PASS;
+        PASS(xdp);
     }
     ssize_t offset = strlen(SET_CMD);
 
     ssize_t keylen_s = datafind1(data, offset, offset + 20, ' ');
     if (keylen_s < 0) {
         NOTIFY(xdp, "SET but no space");
-        return XDP_PASS;
+        PASS(xdp);
     }
     size_t keylen = keylen_s;
 
@@ -497,7 +440,7 @@ int  handle_set(struct xdp_md *xdp) {
         NOTIFY(xdp, "SET but too big");
         size_t ks = keylen;
         PKT_EVT.perf_submit(xdp, &ks, sizeof(ks));
-        return XDP_PASS;
+        PASS(xdp);
     }
 
 #pragma unroll
@@ -513,7 +456,7 @@ int  handle_set(struct xdp_md *xdp) {
     if (rn_off == 0) {
         NOTIFY(xdp, "Set but no rn");
         PKT_EVT.perf_submit(xdp, &keylen, sizeof(keylen));
-        return XDP_PASS;
+        PASS(xdp);
     }
 
     offset = rn_off;
@@ -522,7 +465,7 @@ int  handle_set(struct xdp_md *xdp) {
     size_t val_end = datafind3(data, offset, '\r', '\n');
     if (val_end == 0) {
         NOTIFY(xdp, "Set but no value rn");
-        return XDP_PASS;
+        PASS(xdp);
     }
     struct val_t val = {val_end - val_start};
 
@@ -543,23 +486,25 @@ int  handle_set(struct xdp_md *xdp) {
     struct hdrs *h = data_h;
     if (data_h + sizeof(*h) > data_hend) {
         NOTIFY(xdp, "HOW, THOUGH!");
-        return XDP_PASS;
+        PASS(xdp);
     }
     struct hdrs h_orig = *h;
 
-    int rtn = bpf_xdp_adjust_head(xdp, -strlen(STORED_STR));
+    //int rtn = bpf_xdp_adjust_head(xdp, -strlen(STORED_STR));
 
     void *data_n = (void*)(long)xdp->data;
     void *data_nend = (void*)(long)xdp->data_end;
     struct hdrs *h_new = data_n;
     if (data_n + sizeof(*h_new) > data_nend) {
         NOTIFY(xdp, "HOW, THOUGH!");
-        return XDP_PASS;
+        PASS(xdp);
     }
     *h_new = h_orig;
     swap_direction(h_new);
 
     __u16 prevlen = (h_new->ip.tot_len);
+    h_new->mcd.seq = 0;
+    h_new->mcd.zero = 0;
     h_new->ip.tot_len = htons(sizeof(struct hdrs) + sizeof(STORED_STR) - 14);
     h_new->udp.len = htons(16 + sizeof(STORED_STR) - 1);
     h_new->udp.check = 0;
@@ -569,10 +514,14 @@ int  handle_set(struct xdp_md *xdp) {
     char stored[] = STORED_STR;
     if (data_n + sizeof(*h_new) + strlen(STORED_STR) > data_nend) {
         NOTIFY(xdp, "HOW, THOUGH!");
-        return XDP_PASS;
+        PASS(xdp);
     }
     memcpy(data_n + sizeof(*h_new), stored,  strlen(STORED_STR));
-    //return XDP_PASS;
+
+    value = storedcnt.lookup(&k);
+    if (value)
+        *value += 1;
+    //return XDP_PASS;;
     return XDP_TX;
     //return tx_port.redirect_map(0,0);
 
@@ -649,9 +598,6 @@ int  handle_set(struct xdp_md *xdp) {
 int handle_ingress(struct xdp_md *xdp) {
     long *value;
     uint32_t key = 0;
-    value = rxcnt.lookup(&key);
-    if (value) 
-        *value += 1;
     void *data = (void*)(long)xdp->data;
     void *data_end = (void*)(long)xdp->data_end;
     size_t data_len = (long)data_end - (long)data;
@@ -661,24 +607,24 @@ int handle_ingress(struct xdp_md *xdp) {
     size_t hdrsize = sizeof(*hdr_p);
     if (data +sizeof(*hdr_p) > data_end) {
         NOTIFY(xdp, "TOO SMALL");
-        return XDP_PASS;
+        PASS(xdp);
     }
     //PKT_EVT.perf_submit(xdp, &data_len, sizeof(data_len));
     //PKT_EVT.perf_submit(xdp, &hdrsize, sizeof(data_len));
     struct hdrs hdr = *hdr_p;
     if (hdr.udp.dest != htons(11211)) {
         NOTIFY(xdp, "WRONG PORT");
-        return XDP_PASS;
+        PASS(xdp);
     }
 
     struct data_t *data_cp = datamap.lookup(&key);
     if (!data_cp) {
         NOTIFY(xdp, "NO DATA SLOT");
-        return XDP_PASS;
+        PASS(xdp);
     }
     //void *data_nohdr = data + sizeof(hdr);
 
-    CP_60(data_cp->data, data, data_end);
+    CP_46(data_cp->data, data, data_end);
 
 
     //CP_10(data_cp->data, data, data_end);
@@ -693,15 +639,17 @@ int handle_ingress(struct xdp_md *xdp) {
         return XDP_PASS;
     }*/
 
+
     if (datacmp(data_cp, SET_CMD, strlen(SET_CMD))) {
+        //return handle_set(xdp);
         prog_array.call(xdp, 1);
-        return 0;
     }
 
     if (datacmp(data_cp, GET_CMD, strlen(GET_CMD))) {
+        //return handle_get(xdp);
         prog_array.call(xdp, 2);
-        return 0;
     }
+    NOTIFY(xdp, "NOT 4 me");
 
     return XDP_PASS;
 

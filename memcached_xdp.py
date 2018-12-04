@@ -45,7 +45,6 @@ def main():
 
     b['NOTIFY_EVT'].open_perf_buffer(print_notification)
     b['PKT_EVT'].open_perf_buffer(print_pkt_size)
-    rxcnt = b.get_table("rxcnt")
 
     try:
         print "ready"
@@ -59,7 +58,17 @@ def main():
     b.remove_xdp(in_if, flags)
 
     print set([v.size for v in b['MCD_MAP'].values()])
-    print set([v.keysize for v in b['MCD_MAP'].values()])
+    print set([len(k.key) for k in b['MCD_MAP'].keys()])
+
+    def showit(labs):
+        for i in range(16):
+            print '\t'.join([str(b[lab][0][i]) for lab in labs])
+        for lab in labs:
+            print lab
+            print sum(b[lab][0])
+
+
+    showit(['getcnt', 'valcnt', 'setcnt', 'storedcnt'])
 
     print len(b['MCD_MAP'])
 

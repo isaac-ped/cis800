@@ -5,6 +5,7 @@
 #include <uapi/linux/pkt_cls.h>
 
 BPF_PERF_OUTPUT(NOTIFY_EVT);
+BPF_PERF_OUTPUT(PKT_EVT);
 
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest),(src),(n))
@@ -20,7 +21,7 @@ for (int i=0; i < n; i++) dest[i] = src[i];
 
 #define MAX_NOT 32
 
-#define MAX_KEYLEN 18
+#define MAX_KEYLEN 32
 #define MAX_VALLEN 18
 
 struct key_t {
@@ -32,7 +33,7 @@ struct val_t {
     char val[MAX_VALLEN];
 };
 
-BPF_HASH(MCD_MAP, struct key_t, struct val_t, 1024);
+BPF_HASH(MCD_MAP, struct key_t, struct val_t, 3e7);
 
 struct not_t {
     size_t len;
@@ -179,6 +180,7 @@ static inline ssize_t back_tok2(char *payload, char *end, char tok1, char tok2, 
 #define NOT_FOUND_STR "NOT_FOUND\r\n"
 #define VAL_STR "VALUE "
 #define FLAG_STR " 0 "
+#define END_STR "END\r\n"
 
 static inline size_t itoc(size_t s, char *b) {
     int maxmult = 1;
@@ -205,20 +207,19 @@ static inline size_t itoc(size_t s, char *b) {
 static inline bool handle_get(struct __sk_buff *skb, char *payload, char *end) {
     char *next;
     if (!(next = MEM_ADV(payload, GET_CMD, end))) {
-        NOTIFY(skb, "No GET");
         return false;
     }
 
     ssize_t keylen_s = tok2(next, end, "\r\n", 2, MAX_KEYLEN);
     if (keylen_s < 2) {
-        NOTIFY(skb, "no key");
+        NOTIFY(skb, "GET with no key");
         return false;
     }
 
     size_t keylen = keylen_s;
     struct key_t key = {};
     if (keylen >= sizeof(key.key)) {
-        NOTIFY(skb, "too big!");
+        NOTIFY(skb, "GET but too big!");
         return false;
     }
 
@@ -228,7 +229,7 @@ static inline bool handle_get(struct __sk_buff *skb, char *payload, char *end) {
             key.key[i] = next[i];
         }
     }
-    notify(skb, key.key, MAX_KEYLEN);
+    //notify(skb, key.key, MAX_KEYLEN);
 
     struct val_t *val = MCD_MAP.lookup(&key);
     if (val == NULL) {
@@ -258,8 +259,8 @@ static inline bool handle_get(struct __sk_buff *skb, char *payload, char *end) {
     bpf_skb_store_bytes(skb, off,
                         &sizestr, 6, 0);
 
-    off += sizesize;
-    char delim[] = " \r\n";
+    off += sizesize ;
+    char delim[] = "\r\n";
     bpf_skb_store_bytes(skb, off,
                         &delim, sizeof(delim), 0);
 
@@ -268,33 +269,50 @@ static inline bool handle_get(struct __sk_buff *skb, char *payload, char *end) {
                         &val->val, MAX_VALLEN, 0);
     off += val->size;
 
+    char endstr[] = END_STR;
+    bpf_skb_store_bytes(skb, off,
+                        &endstr, sizeof(endstr), 0);
+    off += sizeof(endstr) - 1;
+
     swap_direction(skb);
+    struct hdrs hdr;
+    bpf_skb_load_bytes(skb, 0,  &hdr, sizeof(hdr));
+    size_t prevlen = hdr.ip.tot_len;
+    hdr.ip.tot_len = htons(off - 14);
+    size_t prevudplen = hdr.udp.len;
+    hdr.udp.len = htons(off - sizeof(struct hdrs) + sizeof(struct udphdr) + sizeof(struct mcdhdr));
+    hdr.mcd.seq = 0;
+    hdr.mcd.zero = 0;
+    hdr.udp.check = 0;
+    bpf_skb_store_bytes(skb, 0, &hdr, sizeof(hdr), 0);
+    bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check), prevlen, hdr.ip.tot_len, 2);
+
     int rtn = bpf_skb_change_tail(skb, off, 0);
-    bpf_clone_redirect(skb, 5, 0);
+    bpf_clone_redirect(skb, 7, 0);
 
 
     return true;
 
 }
 
+#define IP_CSUM_OFFSET (ETH_HLEN + offsetof(struct iphdr, check))
 #define STORED_STR "STORED\r\n"
 
 static inline bool handle_set(struct __sk_buff *skb, char *payload, size_t origlen) {
     char *end = payload + origlen;
     char *next;
     if (!(next = MEM_ADV(payload, SET_CMD, end))) {
-        NOTIFY(skb, "No SET");
         return false;
     }
     ssize_t keylen_s = tok(next, end, ' ');
     if (keylen_s < 0) {
-        NOTIFY(skb, "no space");
+        NOTIFY(skb, "SET but no space");
         return false;
     }
     size_t keylen = keylen_s;
     struct key_t key = {};
     if (keylen >= sizeof(key.key)) {
-        NOTIFY(skb, "too big!");
+        NOTIFY(skb, "SET but too big!");
         return false;
     }
     for (int i=0; i < sizeof(key.key); i++) {
@@ -302,11 +320,12 @@ static inline bool handle_set(struct __sk_buff *skb, char *payload, size_t origl
             key.key[i] = next[i];
         }
     }
+    NOTIFY(skb, "Setting");
     notify(skb, key.key, MAX_KEYLEN);
 
     ssize_t ret_off = tok2(next, end, "\r\n", 2, MAX_KEYLEN);
     if (ret_off < 0) {
-        NOTIFY(skb, "No \\r\\n");
+        NOTIFY(skb, "SET BUT No \\r\\n");
         return false;
     }
     next += ret_off;
@@ -319,7 +338,7 @@ static inline bool handle_set(struct __sk_buff *skb, char *payload, size_t origl
 
     ssize_t sval_ret = back_tok2(val_end,  end, '\r', '\n', 16);
     if (sval_ret < 0) {
-        NOTIFY(skb, "No val \\r\\n");
+        NOTIFY(skb, "SET BUT No val \\r\\n");
         return false;
     }
     size_t val_ret = sval_ret + 2;
@@ -336,8 +355,20 @@ static inline bool handle_set(struct __sk_buff *skb, char *payload, size_t origl
     char stored[] = STORED_STR;
     bpf_skb_store_bytes(skb, sizeof(struct hdrs),
                         &stored, sizeof(stored), 0);
-    int rtn = bpf_skb_change_tail(skb, sizeof(struct hdrs) + sizeof(stored), 0);
-    bpf_clone_redirect(skb, 5, 0);
+    struct hdrs hdr;
+    bpf_skb_load_bytes(skb, 0,  &hdr, sizeof(hdr));
+    size_t prevlen = hdr.ip.tot_len;
+    hdr.ip.tot_len = htons(sizeof(struct hdrs) + sizeof(STORED_STR) - 14);
+    size_t prevudplen = hdr.udp.len;
+    hdr.udp.len = htons(16 + sizeof(STORED_STR) - 1);
+    hdr.mcd.seq = 0;
+    hdr.mcd.zero = 0;
+    hdr.udp.check = 0;
+    bpf_skb_store_bytes(skb, 0, &hdr, sizeof(hdr), 0);
+    bpf_l3_csum_replace(skb, sizeof(struct ethhdr) + offsetof(struct iphdr, check), prevlen, hdr.ip.tot_len, 2);
+    //bpf_l4_csum_replace(skb, offsetof(struct hdrs, udp) + offsetof(struct udphdr, check), , u64 to, u64 flags)
+    int rtn = bpf_skb_change_tail(skb, sizeof(struct hdrs) + sizeof(STORED_STR), 0);
+    bpf_clone_redirect(skb, 7, 0);
     return true;
 }
 
@@ -346,28 +377,33 @@ int handle_ingress(struct __sk_buff *skb) {
     void *data_end = (void *)(long)skb->data_end;
     size_t data_len = (long)data_end - (long)data;
 
+    struct hdrs hdr;
+    bpf_skb_load_bytes(skb, 0,  &hdr, sizeof(hdr));
+
+    /*
     struct hdrs *hdrs_p = data;
+    size_t hdr_size = sizeof(*hdrs_p);
     if (data + sizeof(*hdrs_p) > data_end) {
+        PKT_EVT.perf_submit(skb, &data_len, sizeof(data_len));
+        PKT_EVT.perf_submit(skb, &hdr_size, sizeof(data_len));
         NOTIFY(skb, "too short");
         return TC_ACT_OK;
     }
-
-    struct hdrs hdr = *hdrs_p;
-
+    */
+    //struct hdrs hdr = *hdrs_p;
+    NOTIFY(skb, "I AM HERE!");
     if (hdr.udp.dest != htons(11211)) {
         NOTIFY(skb, "WRONG PORT");
         return TC_ACT_OK;
     }
     int rtn = bpf_skb_change_tail(skb, 1024, 0);
-    char payload[256];
-    bpf_skb_load_bytes(skb, sizeof(hdr), payload, 256);
+    char payload[100];
+    bpf_skb_load_bytes(skb, sizeof(hdr), payload, 200);
     if (handle_set(skb, payload, data_len)) {
-        NOTIFY(skb, "HANDLED SET");
         return TC_ACT_REDIRECT;
     }
 
-    if (handle_get(skb, payload, payload + 256)) {
-        NOTIFY(skb, "HANDLED GET");
+    if (handle_get(skb, payload, payload + 200)) {
         return TC_ACT_REDIRECT;
     }
 
